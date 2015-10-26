@@ -2,6 +2,8 @@ import numpy
 import theano, theano.tensor as T
 import random
 import time
+import theano.sparse
+import theano.sandbox
 
 #Tree stuff
 
@@ -52,7 +54,7 @@ def build_binary_tree(values):
             p[1].parent = tn
             p[1].parent_choice = 1
             p[0].parent = tn
-            p[0].parent_choice = 0
+            p[0].parent_choice = -1
             new_layer.append(tn)
         if len(current_layer) > 0:
             new_layer.extend(current_layer)
@@ -64,8 +66,9 @@ def build_binary_tree(values):
 
 class Model():
 
-    def __init__(self, tree, size):
+    def __init__(self, tree, size, mb_size):
 
+        self.mb_size = mb_size
         self.learning_rate = 0.5
         self.size = size
         self.rng = numpy.random.RandomState(1234)
@@ -116,59 +119,69 @@ class Model():
         self.mask_matrix = theano.shared(value=self.mask_matrix_val, name = 'route_mask_matrix', borrow = True)
 
         #Parameter_matrix_W
-        wp_val=numpy.asarray(self.rng.uniform(low=-numpy.sqrt(6. / (size + 2)), high=numpy.sqrt(6. / (size + 2)),size=(len(self.nodes), size * 2)),dtype=theano.config.floatX)
-        self.wp_matrix = theano.shared(value=wp_val,name='b_soft',borrow=True)
+        #Make this a little nicer
+        wp_val=numpy.asarray(self.rng.uniform(low=-numpy.sqrt(6. / (size + 2)), high=numpy.sqrt(6. / (size + 2)),size=(len(self.nodes), size)),dtype=theano.config.floatX)
+        self.wp_matrix = theano.shared(value=wp_val,name='V_soft',borrow=True)
         #Parameter_matrix_b
-        self.bp_matrix = theano.shared(value=numpy.zeros((len(self.nodes), 2),dtype=theano.config.floatX),name='b_soft',borrow=True)
+        #self.bp_matrix = theano.shared(value=numpy.zeros((len(self.nodes), 2),dtype=theano.config.floatX),name='b_soft',borrow=True)
 
 
-    def get_functions(self):
+    def get_functions(self, xs=None, ys=None):
 
         y = T.lvector()
-        n_node_route = self.route_node_matrix[y].T
-        n_choice_route = self.route_choice_matrix[y].T
-        n_mask = self.mask_matrix[y].T
+        n_node_route = self.route_node_matrix[y]
+        n_choice_route = self.route_choice_matrix[y]
+        n_mask = self.mask_matrix[y]
         x = T.dmatrix()
 
-        def step(r,c,iv):
+        #1.
+        nodes = self.route_node_matrix[y]
+        choices = self.route_choice_matrix[y]
+        mask = self.mask_matrix[y]
 
-            bs = self.bp_matrix[r]
-            wps = self.wp_matrix[r].reshape((r.shape[0], iv.shape[1], 2))
-            #c = T.dot(iv, wps) + bs
+        #2.
+        wp = self.wp_matrix[nodes]
 
-            #The funny indexes are because we only want (0,0), (1,1) ... etc out of the dot product below
-            #there might be a more enlightened way to go about this
-            c_eb = T.dot(iv, wps)[T.arange(bs.shape[0]),T.arange(bs.shape[0])] + bs
-            e = T.nnet.softmax(c_eb)
-            d = T.nnet.softmax(c_eb)[T.arange(bs.shape[0]), c]
+        #3. Let's make the gemv
 
-            return bs, wps, e, d
+        batch_size = x.shape[0]
+        vec_size = x.shape[1]
+        route_size = n_choice_route.shape[1]
 
-        results, _ = theano.scan(fn=step, sequences = [n_node_route, n_choice_route], non_sequences=[x,], outputs_info = [None, None, None, None])
-        #res_f = theano.function([x, y], [results[0], results[1], results[2], results[3]])
-        res_f = theano.function([x, y], [results[3]])
+        #output shape
+        o = T.zeros((batch_size, route_size, 1))
+        #let's 
+        ewps = wp.reshape((batch_size, route_size, vec_size, 1))
+        ewp = theano.function([x, y], ewps)
 
-        #Yes! Finally! The function works! Now continue it to produce the product.
+        #Check these
+        idx = T.arange(batch_size).reshape((batch_size,1))
+        ebin = []
+        for i in range(self.mb_size):
+            ebin.append(numpy.arange(self.max_route_len))
+        odx = T.as_tensor_variable(numpy.asarray(ebin)) 
 
-        log_prob_matrix = T.log(results[3])
-        masked_log_probs = log_prob_matrix * n_mask
-        log_prob_sums = T.sum(masked_log_probs.T, axis=1)
-        cost = -T.mean(log_prob_sums)
+        iv = x.reshape((x.shape[0], 1, x.shape[1]))
 
-        get_mask = theano.function([y], [n_mask])
-        get_log_prob = theano.function([x, y], [log_prob_sums])
-        get_cost = theano.function([x,y], [cost])
-        #res = get_cost(numpy.array([[1,1,1,1,1],[2,2,2,2,2]]) ,[1,4])
-        #Works so far, good.
+        gb = theano.sandbox.blocksparse.SparseBlockGemv()
+        node = gb.make_node(o, ewps, iv, idx, odx)
 
-        #Simple sgd
-        params = [self.wp_matrix, self.bp_matrix]
+        matrix_f = theano.function([x, y], node.outputs[0])
+
+        #The dots are done, now is time of direction and the mask
+        dots_with_choice = node.outputs[0].reshape((batch_size ,route_size)) * choices
+        log_sig = T.log(T.nnet.sigmoid(dots_with_choice)) * mask
+
+        sums = T.sum(log_sig, axis=1)
+        cost = -T.mean(sums)
+        params = [self.wp_matrix,]
+
         gparams = [T.grad(cost, param) for param in params]
         updates = [(param, param - self.learning_rate * gparam) for param, gparam in zip(params, gparams)]
         train_f = theano.function(inputs=[x, y], outputs=[cost], updates=updates)
-        #Seems to work, let's return the function
-        #for r in range(20):
-        #    print train_f(numpy.array([[1,1,1,1,1],[2,2,2,2,2]]) ,[1,4])
+
+        #import pdb;pdb.set_trace()
+
         return train_f
 
     def get_route(self, i):
@@ -186,75 +199,69 @@ class Model():
 
 if __name__ == "__main__":
 
-    output_size = 5000
-    size = 5
-
+    output_size = 50000
+    size = 100
+    mb_size = 10
     values = range(output_size)#10405)
     tree = build_binary_tree(values)
-    print tree
-    model = Model(tree, size)
-    train_f = model.get_functions()
-
+    #print tree
+    model = Model(tree, size, mb_size)
     #Let's build some random training data
     examples = []
 
     for v in values:
-        for i in range(10):
+        for i in range(2):
             examples.append(([random.uniform(-1,1) for x in range(size)], v))
 
     random.shuffle(examples)
 
     #Minibatches
     minibatches = []
-    for i in range(0, len(examples), 10):
-        exs = examples[i:i+10]
+    for i in range(0, len(examples), mb_size):
+        exs = examples[i:i+mb_size]
         batch = [[],[]]
         for e in exs:
             batch[0].append(e[0])
             batch[1].append(e[1])
         minibatches.append(batch)
 
-    start = time.time()
-
-    for i in range(2):
-        costs = []
-        for mb in minibatches:
-            costs.append(train_f(numpy.array(mb[0]), mb[1]))
-        print numpy.mean(costs)
-
-    end = time.time()
-    print 'TIME', end - start
-
+    #mb = minibatches[0]
+    #train_f = model.get_functions(numpy.array(mb[0]), mb[1])
+    train_f = model.get_functions()
     #Baseline
-    size = 5
-    size_out = 5000
-    soft_out = 5000
-
     x = T.matrix('x')  # data, presented as rasterized images
     y = T.ivector('y')  # labels, presented as 1D vector of [int] labels
     rng = numpy.random.RandomState(1234)
     learning_rate = 0.5
     W = theano.shared(value=numpy.asarray(rng.uniform(low=-numpy.sqrt(6. / (size + 2)), high=numpy.sqrt(6. / (size + 2)),size=(size, soft_out)),dtype=theano.config.floatX), name = 'W_soft', borrow = True)
-    b = theano.shared(value=numpy.zeros((soft_out,),dtype=theano.config.floatX),name='b_soft',borrow=True)
+    b = theano.shared(value=numpy.zeros((output_size,),dtype=theano.config.floatX),name='b_soft',borrow=True)
     params = [W, b]
     p_y_given_x = T.nnet.softmax(T.dot(x, W) + b)
     cost = -T.mean(T.log(p_y_given_x)[T.arange(y.shape[0]), y])
     g_W = T.grad(cost=cost, wrt=W)
     g_b = T.grad(cost=cost, wrt=b)
     updates = [(W, W - learning_rate * g_W), (b, b - learning_rate * g_b)]
-    train_f = theano.function(inputs=[x, y], outputs=[cost], updates=updates)
+    train_nf = theano.function(inputs=[x, y], outputs=[cost], updates=updates)
 
     #
     start = time.time()
     for i in range(2):
         costs = []
-        for mb in minibatches:
-            costs.append(train_f(numpy.array(mb[0]), mb[1]))
-        print numpy.mean(costs)
+        f_times = []
+        nf_times = []
 
-    end = time.time()
-    print 'TIME', end - start
+        for mb in minibatches[:2]:
+            start = time.time()
+            cost = train_f(numpy.array(mb[0]), mb[1])
+            end = time.time()
+            f_times.append(end - start)
 
-    #import pdb;pdb.set_trace()
+            start = time.time()
+            train_nf(numpy.array(mb[0]), mb[1])
+            end = time.time()
+            nf_times.append(end - start)
+
+
+    print numpy.mean(f_times), numpy.mean(nf_times)
     
 
